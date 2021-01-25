@@ -229,7 +229,38 @@ if (!mDanmakusVisible) {
     }
 }
 ```
-DanmakuView 的 drawDanmakus 方法中通过同步时间并且更新计时，并控制最多16ms一帧，弹幕的滑动就是靠时间来计算位置并更新。调用 lockCanvas 方法并执行 postInvalidateCompat 方法触发 DanmakuView 自身 onDraw 方法的调用。
+DanmakuView 的 drawDanmakus 方法中通过同步时间并且更新计时，弹幕的滑动就是靠时间来计算位置并更新。调用 lockCanvas 方法并执行 postInvalidateCompat 方法触发 DanmakuView 自身 onDraw 方法的调用。
+```java
+protected void lockCanvas() {
+    if(mDanmakuVisible == false) {
+        return;
+    }
+    postInvalidateCompat();
+    synchronized (mDrawMonitor) {
+        while ((!mDrawFinished) && (handler != null)) {
+            try {
+                mDrawMonitor.wait(200);
+            } catch (InterruptedException e) {
+                if (mDanmakuVisible == false || handler == null || handler.isStop()) {
+                    break;
+                } else {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+        mDrawFinished = false;
+    }
+}
+
+private void postInvalidateCompat() {
+    mRequestRender = true;
+    if(Build.VERSION.SDK_INT >= 16) {
+        this.postInvalidateOnAnimation();
+    } else {
+        this.postInvalidate();
+    }
+}
+```
 ```java
 @Override
 protected void onDraw(Canvas canvas) {
@@ -267,4 +298,146 @@ public RenderingState draw(Canvas canvas) {
     return mRenderingState;
 }
 ```
+DrawTask 的 draw 方法中调用自身的 drawDanmakus，继续跟踪到了 DrawTask 的 drawDanmakus 方法，代码太多只看关键
+```java
+protected RenderingState drawDanmakus(AbsDisplayer disp, DanmakuTimer timer) {
+    //...
+    if (danmakuList != null) {
+        // ...
+        IDanmakus screenDanmakus = danmakus;
+        if(mLastBeginMills > beginMills || timer.currMillisecond > mLastEndMills) {
+            screenDanmakus = danmakuList.sub(beginMills, endMills);
+            if (screenDanmakus != null) {
+                danmakus = screenDanmakus;
+            }
+            mLastBeginMills = beginMills;
+            mLastEndMills = endMills;
+        } else {
+            beginMills = mLastBeginMills;
+            endMills = mLastEndMills;
+        }
 
+        // prepare runningDanmakus to draw (in sync-mode)
+        IDanmakus runningDanmakus = mRunningDanmakus;
+        beginTracing(renderingState, runningDanmakus, screenDanmakus);
+        if (runningDanmakus != null && !runningDanmakus.isEmpty()) {
+            mRenderingState.isRunningDanmakus = true;
+            mRenderer.draw(disp, runningDanmakus, 0, mRenderingState);
+        }
+
+        // draw screenDanmakus
+        mRenderingState.isRunningDanmakus = false;
+        if (screenDanmakus != null && !screenDanmakus.isEmpty()) {
+            mRenderer.draw(mDisp, screenDanmakus, mStartRenderTime, renderingState);
+            //...
+        } else {
+            // ...
+        }
+    }
+    return null;
+}
+```
+首先截取要显示的弹幕，通过 DanmakuRenderer 的 draw 方法开始绘制。danmakuList是一个弹幕Collection，addDanmaku 和 removeDanmaku 方法就是在操作此集合。
+
+跟踪到DanmakuRenderer的draw方法，在该方法中调用了Danmakus中的foreach，去遍历所有被添加进去的弹幕实例
+```java
+ public void forEach(Consumer<? super BaseDanmaku, ?> consumer) {
+    consumer.before();
+    Iterator<BaseDanmaku> it = items.iterator();
+    while (it.hasNext()) {
+        BaseDanmaku next = it.next();
+        if (next == null) {
+            continue;
+        }
+        int action = consumer.accept(next);
+        if (action == DefaultConsumer.ACTION_BREAK) {
+            break;
+        } else if (action == DefaultConsumer.ACTION_REMOVE) {
+            it.remove();
+            mSize.decrementAndGet();
+        } else if (action == DefaultConsumer.ACTION_REMOVE_AND_BREAK) {
+            it.remove();
+            mSize.decrementAndGet();
+            break;
+        }
+    }
+    consumer.after();
+}
+```
+foreach 方法中将每个弹幕实例交给 consumer 的 accept 方法执行。Consumer 是 DanmakuRender 类的私有内部类，accept 核心代码如下
+```java
+public int accept(BaseDanmaku drawItem) {
+    lastItem = drawItem;
+    if (drawItem.isTimeOut()) {
+        disp.recycle(drawItem);
+        return renderingState.isRunningDanmakus ? ACTION_REMOVE : ACTION_CONTINUE;
+    }
+
+    if (!renderingState.isRunningDanmakus && drawItem.isOffset()) {
+        return ACTION_CONTINUE;
+    }
+
+    if (!drawItem.hasPassedFilter()) {
+        mContext.mDanmakuFilters.filter(drawItem, renderingState.indexInScreen, renderingState.totalSizeInScreen, renderingState.timer, false, mContext);
+    }
+    if (drawItem.getActualTime() < startRenderTime
+            || (drawItem.priority == 0 && drawItem.isFiltered())) {
+        return ACTION_CONTINUE;
+    }
+
+    if (drawItem.isLate()) {
+        IDrawingCache<?> cache = drawItem.getDrawingCache();
+        if (mCacheManager != null && (cache == null || cache.get() == null)) {
+            mCacheManager.addDanmaku(drawItem);
+        }
+        return ACTION_BREAK;
+    }
+
+    if (drawItem.getType() == BaseDanmaku.TYPE_SCROLL_RL) {
+        // 同屏弹幕密度只对滚动弹幕有效
+        renderingState.indexInScreen++;
+    }
+
+    // measure
+    if (!drawItem.isMeasured()) {
+        drawItem.measure(disp, false);
+    }
+
+    // notify prepare drawing
+    if (!drawItem.isPrepared()) {
+        drawItem.prepare(disp, false);
+    }
+
+    // layout
+    mDanmakusRetainer.fix(drawItem, disp, mVerifier);
+
+    // draw
+    if (drawItem.isShown()) {
+        if (drawItem.lines == null && drawItem.getBottom() > disp.getHeight()) {
+            return ACTION_CONTINUE;    // skip bottom outside danmaku
+        }
+        int renderingType = drawItem.draw(disp);
+        if (renderingType == IRenderer.CACHE_RENDERING) {
+            renderingState.cacheHitCount++;
+        } else if (renderingType == IRenderer.TEXT_RENDERING) {
+            renderingState.cacheMissCount++;
+            if (mCacheManager != null) {
+                mCacheManager.addDanmaku(drawItem);
+            }
+        }
+        renderingState.addCount(drawItem.getType(), 1);
+        renderingState.addTotalCount(1);
+        renderingState.appendToRunningDanmakus(drawItem);
+
+        if (mOnDanmakuShownListener != null
+                && drawItem.firstShownFlag != mContext.mGlobalFlagValues.FIRST_SHOWN_RESET_FLAG) {
+            drawItem.firstShownFlag = mContext.mGlobalFlagValues.FIRST_SHOWN_RESET_FLAG;
+            mOnDanmakuShownListener.onDanmakuShown(drawItem);
+        }
+    }
+    return ACTION_CONTINUE;
+}
+```
+在从弹幕 Collection 集合取出的 DanmakuView 传给 accept，在 accept 中见到了我们熟悉的自定义view三大步，测量(measure)、布局(layout)、绘制(draw)。
+
+测量、布局、绘制都使用到了同一个参数：disp。measure 和 draw最终都交给了 AbsDisplayer 的实现 AndroidDisplayer 去做。AndroidDisplayer 中提供了一个静态内部类 DisplayerConfig。查看DisplayerConfig 中提供的属性，不难看出，我们最初在 DanmakuContext 时提供的初始化属性，最终都被设置到了 DisplayerConfig 上。
