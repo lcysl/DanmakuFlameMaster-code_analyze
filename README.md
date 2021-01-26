@@ -367,36 +367,7 @@ protected RenderingState drawDanmakus(AbsDisplayer disp, DanmakuTimer timer) {
 foreach 方法中将每个弹幕实例交给 consumer 的 accept 方法执行。Consumer 是 DanmakuRender 类的私有内部类，accept 核心代码如下
 ```java
 public int accept(BaseDanmaku drawItem) {
-    lastItem = drawItem;
-    if (drawItem.isTimeOut()) {
-        disp.recycle(drawItem);
-        return renderingState.isRunningDanmakus ? ACTION_REMOVE : ACTION_CONTINUE;
-    }
-
-    if (!renderingState.isRunningDanmakus && drawItem.isOffset()) {
-        return ACTION_CONTINUE;
-    }
-
-    if (!drawItem.hasPassedFilter()) {
-        mContext.mDanmakuFilters.filter(drawItem, renderingState.indexInScreen, renderingState.totalSizeInScreen, renderingState.timer, false, mContext);
-    }
-    if (drawItem.getActualTime() < startRenderTime
-            || (drawItem.priority == 0 && drawItem.isFiltered())) {
-        return ACTION_CONTINUE;
-    }
-
-    if (drawItem.isLate()) {
-        IDrawingCache<?> cache = drawItem.getDrawingCache();
-        if (mCacheManager != null && (cache == null || cache.get() == null)) {
-            mCacheManager.addDanmaku(drawItem);
-        }
-        return ACTION_BREAK;
-    }
-
-    if (drawItem.getType() == BaseDanmaku.TYPE_SCROLL_RL) {
-        // 同屏弹幕密度只对滚动弹幕有效
-        renderingState.indexInScreen++;
-    }
+    // ...
 
     // measure
     if (!drawItem.isMeasured()) {
@@ -441,3 +412,180 @@ public int accept(BaseDanmaku drawItem) {
 在从弹幕 Collection 集合取出的 DanmakuView 传给 accept，在 accept 中见到了我们熟悉的自定义view三大步，测量(measure)、布局(layout)、绘制(draw)。
 
 测量、布局、绘制都使用到了同一个参数：disp。measure 和 draw最终都交给了 AbsDisplayer 的实现 AndroidDisplayer 去做。AndroidDisplayer 中提供了一个静态内部类 DisplayerConfig。查看DisplayerConfig 中提供的属性，不难看出，我们最初在 DanmakuContext 时提供的初始化属性，最终都被设置到了 DisplayerConfig 上。
+### 测量
+```java
+@Override
+public void measure(BaseDanmaku danmaku, boolean fromWorkerThread) {
+    TextPaint paint = getPaint(danmaku, fromWorkerThread);
+    if (mDisplayConfig.HAS_STROKE) {
+        mDisplayConfig.applyPaintConfig(danmaku, paint, true);
+    }
+    calcPaintWH(danmaku, paint, fromWorkerThread);
+    if (mDisplayConfig.HAS_STROKE) {
+        mDisplayConfig.applyPaintConfig(danmaku, paint, false);
+    }
+}
+```
+measure 方法中拿到初始化的 TextPaint，调用 calcPaintWH 方法计算当前弹幕宽高。
+```java
+private void calcPaintWH(BaseDanmaku danmaku, TextPaint paint, boolean fromWorkerThread) {
+    sStuffer.measure(danmaku, paint, fromWorkerThread);
+    setDanmakuPaintWidthAndHeight(danmaku, danmaku.paintWidth, danmaku.paintHeight);
+}
+```
+在测量过程中，还调用了 sStuffer 的 measure 方法，sStuffer 是 BaseCacheStuffer 的实现类 SimpleTextCacheStuffer（BaseCacheStuffer 有多种类型的实现，SimpleTextCacheStuffer 是常用的文字类型的弹幕实现） 的实例，在该 measure 方法中对弹幕中的文本宽高进行了详细计算。
+### 布局
+布局过程调用了 DanmakusRetainer 的 fix 方法，通过设置的弹幕 Type，即显示的方向，来决定使用哪种方式布局
+```java
+public void fix(BaseDanmaku danmaku, IDisplayer disp, Verifier verifier) {
+    int type = danmaku.getType();
+    switch (type) {
+        case BaseDanmaku.TYPE_SCROLL_RL:
+            rldrInstance.fix(danmaku, disp, verifier);
+            break;
+        case BaseDanmaku.TYPE_SCROLL_LR:
+            lrdrInstance.fix(danmaku, disp, verifier);
+            break;
+        case BaseDanmaku.TYPE_FIX_TOP:
+            ftdrInstance.fix(danmaku, disp, verifier);
+            break;
+        case BaseDanmaku.TYPE_FIX_BOTTOM:
+            fbdrInstance.fix(danmaku, disp, verifier);
+            break;
+        case BaseDanmaku.TYPE_SPECIAL:
+            danmaku.layout(disp, 0, 0);
+            break;
+    }
+}
+```
+跟踪代码到
+```java
+drawItem.layout(disp, drawItem.getLeft(), topPos);
+```
+我们使用的是弹幕从右向左布局显示，所以直接看 drawItem 的实现类 R2LDanmaku 的 layout 方法
+```java
+ public void layout(IDisplayer displayer, float x, float y) {
+    if (mTimer != null) {
+        long currMS = mTimer.currMillisecond;
+        long deltaDuration = currMS - getActualTime();
+        if (deltaDuration > 0 && deltaDuration < duration.value) {
+            this.x = getAccurateLeft(displayer, currMS);
+            if (!this.isShown()) {
+                this.y = y;
+                this.setVisibility(true);
+            }
+            mLastTime = currMS;
+            return;
+        }
+        mLastTime = currMS;
+    }
+    this.setVisibility(false);
+}
+```
+通过 getAccurateLeft 获取 X 坐标位置
+```java
+protected float getAccurateLeft(IDisplayer displayer, long currTime) {
+    long elapsedTime = currTime - getActualTime();
+    if (elapsedTime >= duration.value) {
+        return -paintWidth;
+    }
+
+    return displayer.getWidth() - elapsedTime * mStepX;
+}
+```
+getActualTime 返回的是弹幕显示的时间，现在的时间减去弹幕的时间就是已经过去的时间，如果过去的时间超过弹幕的持续时间，说明弹幕已经显示完毕。否则返回
+displayer.getWidth() - elapsedTime * mStepX; 屏幕宽度-时间*速度，即距离左边的距离
+
+从这里可以看出，弹幕的显示就是根据一个计时器更新时间，并根据时间计算弹幕位置，实现弹幕的滑动效果。
+### 绘制
+上面提到绘制的过程和测量一样，也是交给了 AndroidDisplayer 去处理。AndroidDisplayer 的 draw 方法中拿到弹幕的 top、left，以及 Paint 实例。
+接着调用 drawDanmaku 方法，把绘制工作又交给 sStuffer的drawDanmaku 方法，即 SimpleTextCacheStuffer 中的 drawDanmaku 方法，核心代码如下
+```java
+public int draw(BaseDanmaku danmaku) {
+    float top = danmaku.getTop();
+    float left = danmaku.getLeft();
+    if (canvas != null) {
+
+        Paint alphaPaint = null;
+        boolean needRestore = false;
+        if (danmaku.getType() == BaseDanmaku.TYPE_SPECIAL) {
+            if (danmaku.getAlpha() == AlphaValue.TRANSPARENT) {
+                return IRenderer.NOTHING_RENDERING;
+            }
+            if (danmaku.rotationZ != 0 || danmaku.rotationY != 0) {
+                saveCanvas(danmaku, canvas, left, top);
+                needRestore = true;
+            }
+
+            int alpha = danmaku.getAlpha();
+            if (alpha != AlphaValue.MAX) {
+                alphaPaint = mDisplayConfig.ALPHA_PAINT;
+                alphaPaint.setAlpha(danmaku.getAlpha());
+            }
+        }
+
+        // skip drawing when danmaku is transparent
+        if (alphaPaint != null && alphaPaint.getAlpha() == AlphaValue.TRANSPARENT) {
+            return IRenderer.NOTHING_RENDERING;
+        }
+
+        // drawing cache
+        boolean cacheDrawn = sStuffer.drawCache(danmaku, canvas, left, top, alphaPaint, mDisplayConfig.PAINT);
+        int result = IRenderer.CACHE_RENDERING;
+        if (!cacheDrawn) {
+            if (alphaPaint != null) {
+                mDisplayConfig.PAINT.setAlpha(alphaPaint.getAlpha());
+                mDisplayConfig.PAINT_DUPLICATE.setAlpha(alphaPaint.getAlpha());
+            } else {
+                resetPaintAlpha(mDisplayConfig.PAINT);
+            }
+            drawDanmaku(danmaku, canvas, left, top, false);
+            result = IRenderer.TEXT_RENDERING;
+        }
+
+        if (needRestore) {
+            restoreCanvas(canvas);
+        }
+
+        return result;
+    }
+
+    return IRenderer.NOTHING_RENDERING;
+}
+```
+drawDanmaku 关键代码
+```java
+public void drawDanmaku(BaseDanmaku danmaku, Canvas canvas, float left, float top, boolean fromWorkerThread, AndroidDisplayer.DisplayerConfig displayerConfig) {
+    // ...
+    // 绘制背景
+    drawBackground(danmaku, canvas, _left, _top);
+    // draw stroke
+    drawStroke(danmaku, lines[t], canvas, strokeLeft, strokeTop, paint);
+    // draw text
+    drawText(danmaku, lines[t], canvas, left, t * textHeight + top - paint.ascent(), paint, fromWorkerThread);
+
+
+    // draw underline
+    if (danmaku.underlineColor != 0) {
+        Paint linePaint = displayerConfig.getUnderlinePaint(danmaku);
+        float bottom = _top + danmaku.paintHeight - displayerConfig.UNDERLINE_HEIGHT;
+        canvas.drawLine(_left, bottom, _left + danmaku.paintWidth, bottom, linePaint);
+    }
+
+    //draw border
+    if (danmaku.borderColor != 0) {
+        Paint borderPaint = displayerConfig.getBorderPaint(danmaku);
+        canvas.drawRect(_left, _top, _left + danmaku.paintWidth, _top + danmaku.paintHeight,
+                borderPaint);
+    }
+
+}
+```
+最终的绘制都交给了 Stuffer 去处理。在 DanmakuContext 中提供了 setCacheStuffer 方法，允许我们进行 Stuffer 的自定义，例如keep直播弹幕中涉及到圆角弹幕样式，就是利用自定义 Stuffer 来实现。
+到此，弹幕的显示流程就全部执行结束了。整体来看，涉及了如下几个核心类：
+* R2LDanmaku : 一个弹幕对象, 里面包含x、y坐标, 缓存的Bitmap等属性
+* DanmakuView : 用来承载弹幕显示的ViewGroup, 除了它之外还有DanmakuSurfaceView、DanmakuTextureView
+* DrawHandler : 一个绑定了异步HandlerThread的Handler, 控制整个弹幕的显示逻辑
+* CacheManagingDrawTask : 维护需要绘制的弹幕列表, 控制弹幕缓存逻辑
+* DanmakuRenderer : 对弹幕做一些过滤、碰撞检测、测量、布局、缓存等工作
+* AndroidDisplayer : 持有Canvas画布, 绘制弹幕
